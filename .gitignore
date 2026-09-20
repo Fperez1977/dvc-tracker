@@ -3,6 +3,9 @@ data/
 dvc_tracker.db
 purchase_agreements/
 
+# Basic-auth credentials for the reverse proxy — never commit these
+.env
+
 # Python
 __pycache__/
 *.pyc

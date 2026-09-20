@@ -50,7 +50,25 @@ git clone <your-repo-url> .
 sudo docker compose up -d --build
 ```
 
-Then browse to `http://<nas-ip>:8501`.
+Before the first `docker compose up`, set your password (see **Password protection** below) — otherwise the proxy container will fail to start with a "set BASIC_AUTH_USER" error.
+
+Then browse to `http://<nas-ip>:8501` and log in with the username/password you set.
+
+### Password protection
+
+The app itself has no login. Instead, an nginx reverse-proxy container sits in front of it and requires HTTP Basic Auth before any request reaches Streamlit — the `dvc-tracker` container isn't published to the host at all, only the `proxy` container is.
+
+Set it up once, on the NAS, before first starting the stack:
+
+```bash
+cd /volume1/docker/dvc-tracker   # or wherever you cloned this repo
+cp .env.example .env
+nano .env   # set BASIC_AUTH_USER and BASIC_AUTH_PASSWORD to your own values
+```
+
+`.env` is gitignored, so your real username/password never get committed or pushed to GitHub — they only exist in that file on the NAS. The password is read fresh at container start each time (`docker compose up`/`restart`), so changing `.env` and running `sudo docker compose up -d` again rotates the password.
+
+If you ever need to disable auth temporarily (e.g. local debugging), you can bypass the proxy by adding a `ports: ["8501:8501"]` entry back onto the `dvc-tracker` service in `docker-compose.yml` — just remember to remove it again afterward.
 
 ### Data persistence
 
@@ -68,8 +86,8 @@ Or, in Container Manager's UI: open the project → **Action → Build** after p
 
 ### Changing the port
 
-If port 8501 is already in use on your NAS, edit the `ports:` line in `docker-compose.yml`, e.g. `"8601:8501"`, then re-run `docker compose up -d`.
+If port 8501 is already in use on your NAS, edit the `ports:` line under the **`proxy`** service in `docker-compose.yml` (e.g. `"8601:80"`), then re-run `docker compose up -d`.
 
-### Reverse proxy / HTTPS (optional)
+### HTTPS (optional)
 
-To serve this under a subdomain with a Synology-issued certificate, add a **Control Panel → Login Portal → Advanced → Reverse Proxy** rule pointing your desired hostname/port at `localhost:8501` (or whatever host port you chose above).
+To serve this under a subdomain with a Synology-issued certificate, add a **Control Panel → Login Portal → Advanced → Reverse Proxy** rule pointing your desired hostname/port at `localhost:8501` (or whatever host port you chose above). The Basic Auth prompt from the `proxy` container still applies on top of that.

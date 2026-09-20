@@ -7,3 +7,4 @@ purchase_agreements/
 __pycache__/
 *.pyc
 .venv/
+.env
