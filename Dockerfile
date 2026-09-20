@@ -21,8 +21,16 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" || exit 1
 
 ENTRYPOINT ["./entrypoint.sh"]
+# CORS/XSRF checks are disabled here because they're based on comparing the
+# browser's Origin/Host headers to what Streamlit expects — behind the nginx
+# reverse proxy those don't match the NAS's LAN IP, so Streamlit rejects the
+# websocket outright ("Rejecting WebSocket connection with disallowed Origin
+# or Host header"), which is why the UI got stuck on the loading skeleton.
+# The nginx layer (with its Basic Auth) is what actually guards access now.
 CMD ["streamlit", "run", "app.py", \
      "--server.port=8501", \
      "--server.address=0.0.0.0", \
      "--server.headless=true", \
+     "--server.enableCORS=false", \
+     "--server.enableXsrfProtection=false", \
      "--browser.gatherUsageStats=false"]
