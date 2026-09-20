@@ -1,0 +1,9 @@
+.git
+.gitignore
+README.md
+data/
+dvc_tracker.db
+purchase_agreements/
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,13 @@
+# Runtime data — never commit your actual tracker data or documents
+data/
+dvc_tracker.db
+purchase_agreements/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
