@@ -317,6 +317,84 @@ st.markdown(
       margin:-3px 0 12px;
       letter-spacing:.12em;
     }
+
+    /* ---------------------------------------------------------
+       Mobile layout (phones / narrow tablets)
+       --------------------------------------------------------- */
+    @media (max-width: 768px) {
+
+      .block-container {
+        padding-left: 0.9rem !important;
+        padding-right: 0.9rem !important;
+        padding-top: 0.6rem !important;
+      }
+
+      /* Hero: shrink so it doesn't eat the whole first screen,
+         and drop the decorative marks that have no room to breathe. */
+      .dvc-hero {
+        min-height: 0;
+        padding: 20px 20px;
+        border-radius: 22px;
+      }
+      .dvc-hero h1 {
+        font-size: 1.75rem;
+        line-height: 1.15;
+      }
+      .dvc-hero .tagline {
+        font-size: .92rem;
+        max-width: 100%;
+      }
+      .mouse-mark, .spark-field {
+        display: none;
+      }
+
+      /* Tab bar: compact but still horizontally scrollable, so all
+         7 tabs stay reachable with a swipe instead of wrapping/clipping. */
+      .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        padding: 5px;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        flex-wrap: nowrap;
+      }
+      .stTabs [data-baseweb="tab"] {
+        padding: 8px 12px;
+        font-size: .82rem;
+        white-space: nowrap;
+      }
+
+      /* Every st.columns() row (KPI tiles, contract/stay/dues/expense
+         rows, side-by-side form fields) stacks into a single full-width
+         column instead of squeezing into slivers. Rows that are already
+         wrapped in a bordered container keep that border, so each stacked
+         group still reads as one card. */
+      [data-testid="stHorizontalBlock"] {
+        flex-direction: column !important;
+      }
+      [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+        min-width: 100% !important;
+      }
+      [data-testid="stHorizontalBlock"] > [data-testid="column"] + [data-testid="column"] {
+        margin-top: 6px;
+      }
+
+      /* Full-width, larger tap targets now that buttons sit in a
+         stacked column rather than a narrow slice. */
+      .stButton > button, .stDownloadButton > button {
+        width: 100%;
+        border-radius: 14px !important;
+        padding-top: 10px !important;
+        padding-bottom: 10px !important;
+      }
+
+      [data-testid="stMetric"] {
+        padding: 14px;
+      }
+
+      .dvc-hero h1 { text-shadow: 0 2px 10px rgba(0,0,0,.3); }
+    }
     </style>
 
     <div class="dvc-hero">
