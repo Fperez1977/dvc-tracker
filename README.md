@@ -1,6 +1,9 @@
-# DVC Tracker v3.9
+# DVC Tracker v3.10
 
 A Streamlit app for tracking the true cost and value of a Disney Vacation Club membership: contracts, annual dues, stays, trip expenses, and an automatic point ledger.
+
+## Password Protection Rework (v3.10)
+Replaced the nginx + HTTP Basic Auth sidecar with an in-app password screen — same pattern as the Hunger Hive app: one `APP_PASSWORD`, no username, checked inside Streamlit itself. The `proxy` container and `nginx/` folder are gone; `dvc-tracker` now publishes port 8501 directly. See **Password protection** below.
 
 ## Dashboard Priority Order (v3.9)
 The Dashboard is now ordered around what you actually open it to check, top to bottom:
@@ -67,25 +70,29 @@ git clone <your-repo-url> .
 sudo docker compose up -d --build
 ```
 
-Before the first `docker compose up`, set your password (see **Password protection** below) — otherwise the proxy container will fail to start with a "set BASIC_AUTH_USER" error.
+Before the first `docker compose up`, set your password (see **Password protection** below) if you want one — otherwise the app starts with no login at all.
 
-Then browse to `http://<nas-ip>:8501` and log in with the username/password you set.
+Then browse to `http://<nas-ip>:8501`. If you set a password, you'll see a simple password screen first — no username, just like the Hunger Hive app.
 
 ### Password protection
 
-The app itself has no login. Instead, an nginx reverse-proxy container sits in front of it and requires HTTP Basic Auth before any request reaches Streamlit — the `dvc-tracker` container isn't published to the host at all, only the `proxy` container is.
+Same pattern as the Hunger Hive app: a single `APP_PASSWORD`, checked inside the app itself (no separate proxy container, no username field) — just a password box, and a "Log out" button in the top-right once you're in. Leaving `APP_PASSWORD` unset/blank runs the app with no login at all, which keeps local testing frictionless.
 
 Set it up once, on the NAS, before first starting the stack:
 
 ```bash
 cd /volume1/docker/dvc-tracker   # or wherever you cloned this repo
 cp .env.example .env
-nano .env   # set BASIC_AUTH_USER and BASIC_AUTH_PASSWORD to your own values
+cat > .env << 'EOF'
+APP_PASSWORD=your-password-here
+EOF
 ```
 
-`.env` is gitignored, so your real username/password never get committed or pushed to GitHub — they only exist in that file on the NAS. The password is read fresh at container start each time (`docker compose up`/`restart`), so changing `.env` and running `sudo docker compose up -d` again rotates the password.
+(`nano` isn't available on stock DSM's SSH shell — the heredoc above works the same way. Swap in `vi .env` if you prefer an editor.)
 
-If you ever need to disable auth temporarily (e.g. local debugging), you can bypass the proxy by adding a `ports: ["8501:8501"]` entry back onto the `dvc-tracker` service in `docker-compose.yml` — just remember to remove it again afterward.
+`.env` is gitignored, so your real password never gets committed or pushed to GitHub — it only exists in that file on the NAS. It's read once when the container starts, so changing `.env` and running `sudo docker compose up -d` again rotates the password (no rebuild needed, just a container restart — compose picks up the new environment value automatically).
+
+One difference from the Hunger Hive app worth knowing: that app's login persists for 30 days via a signed cookie. Streamlit's `session_state` only lasts for the current browser session (closing the tab, or the app restarting, logs you out) — there's no long-lived "remember me" here without adding an extra package. Fine for occasional use; worth flagging if it becomes annoying.
 
 ### Data persistence
 
@@ -103,8 +110,8 @@ Or, in Container Manager's UI: open the project → **Action → Build** after p
 
 ### Changing the port
 
-If port 8501 is already in use on your NAS, edit the `ports:` line under the **`proxy`** service in `docker-compose.yml` (e.g. `"8601:80"`), then re-run `docker compose up -d`.
+If port 8501 is already in use on your NAS, edit the `ports:` line under the **`dvc-tracker`** service in `docker-compose.yml` (e.g. `"8601:8501"`), then re-run `docker compose up -d`.
 
 ### HTTPS (optional)
 
-To serve this under a subdomain with a Synology-issued certificate, add a **Control Panel → Login Portal → Advanced → Reverse Proxy** rule pointing your desired hostname/port at `localhost:8501` (or whatever host port you chose above). The Basic Auth prompt from the `proxy` container still applies on top of that.
+To serve this under a subdomain with a Synology-issued certificate, add a **Control Panel → Login Portal → Advanced → Reverse Proxy** rule pointing your desired hostname/port at `localhost:8501` (or whatever host port you chose above). The in-app password screen still applies on top of that.

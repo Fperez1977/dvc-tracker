@@ -5,27 +5,17 @@ services:
     # comment out "build: ." above and use "image:" with your own registry tag.
     container_name: dvc-tracker
     restart: unless-stopped
-    # Not published to the host — only the proxy below can reach it, on the
-    # internal docker network, at "dvc-tracker:8501". This is what forces
-    # all traffic through the password prompt.
-    expose:
-      - "8501"
+    ports:
+      # This is the port you actually browse to: http://<nas-ip>:8501
+      # Change the left-hand side if 8501 is already used on your Synology
+      # (e.g. "8601:8501").
+      - "8501:8501"
+    environment:
+      # Same pattern as the Hunger Hive app: set APP_PASSWORD in .env to
+      # require a password (a single field, no username) before the app is
+      # usable. Leave it unset/blank to run with no login at all.
+      APP_PASSWORD: ${APP_PASSWORD}
     volumes:
       # Persists dvc_tracker.db and purchase_agreements/ on the NAS so
       # they survive container recreation and image upgrades.
       - ./data:/app/data
-
-  proxy:
-    build: ./nginx
-    container_name: dvc-tracker-proxy
-    restart: unless-stopped
-    depends_on:
-      - dvc-tracker
-    ports:
-      # This is the port you actually browse to: http://<nas-ip>:8501
-      # Change the left-hand side if 8501 is already used on your Synology
-      # (e.g. "8601:80").
-      - "8501:80"
-    environment:
-      BASIC_AUTH_USER: ${BASIC_AUTH_USER}
-      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD}

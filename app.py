@@ -1,4 +1,6 @@
 import calendar
+import hmac
+import os
 import sqlite3
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -13,9 +15,57 @@ import streamlit as st
 
 DB = "dvc_tracker.db"
 
-APP_VERSION = "3.9"
+APP_VERSION = "3.10"
 
 st.set_page_config(page_title="DVC True Cost Tracker", page_icon="✨", layout="wide")
+
+# ---------------------------------------------------------
+# Password gate — same pattern as the Hunger Hive app: a single APP_PASSWORD
+# env var, no username. Unset (local/dev default) means no login is
+# required at all, so local testing stays frictionless. A real HTTPS
+# reverse proxy is a separate, later concern — this password is a basic
+# gate, not a substitute for TLS.
+# ---------------------------------------------------------
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+
+if APP_PASSWORD and not st.session_state.get("logged_in"):
+    st.markdown(
+        """
+        <style>
+        [data-testid="stHeader"], [data-testid="stToolbar"], #MainMenu, footer { display: none !important; }
+        .login-card {
+            max-width: 360px; margin: 12vh auto 0; padding: 32px 30px;
+            border-radius: 24px; border: 2px solid rgba(255,214,92,.6);
+            background: linear-gradient(145deg,#073b6c,#0a568d);
+            box-shadow: 0 22px 52px rgba(0,20,47,.34);
+            text-align: center; color: white;
+        }
+        .login-card h1 { font-size: 1.4rem; margin: 6px 0 2px; color: white; }
+        .login-card p { color: #cfe6fb; font-size: .9rem; margin-top: 0; }
+        </style>
+        <div class="login-card">
+            <div style="font-size:2.2rem;">✨🏰✨</div>
+            <h1>DVC True Cost Tracker</h1>
+            <p>Enter the password to continue.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    _login_col = st.columns([1, 1.2, 1])[1]
+    with _login_col:
+        with st.form("login_form", clear_on_submit=False):
+            _entered_password = st.text_input("Password", type="password", label_visibility="collapsed", placeholder="Password")
+            _submitted = st.form_submit_button("Log In", use_container_width=True)
+        if _submitted:
+            # Encode to bytes first — compare_digest raises TypeError if either
+            # side has a non-ASCII character, which would otherwise crash on
+            # any password (or mistyped attempt) containing one.
+            if hmac.compare_digest(_entered_password.encode("utf-8"), APP_PASSWORD.encode("utf-8")):
+                st.session_state["logged_in"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    st.stop()
 
 # ---------------------------------------------------------
 # Over-the-top Disney-vacation-inspired visual theme
@@ -420,6 +470,12 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+if APP_PASSWORD:
+    _logout_col = st.columns([6, 1])[1]
+    if _logout_col.button("🔒 Log out", use_container_width=True):
+        st.session_state.pop("logged_in", None)
+        st.rerun()
 
 # -------------------------
 # DB helpers and migrations
