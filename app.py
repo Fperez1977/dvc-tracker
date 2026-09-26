@@ -1,3 +1,4 @@
+import calendar
 import sqlite3
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -12,7 +13,7 @@ import streamlit as st
 
 DB = "dvc_tracker.db"
 
-APP_VERSION = "3.7"
+APP_VERSION = "3.9"
 
 st.set_page_config(page_title="DVC True Cost Tracker", page_icon="✨", layout="wide")
 
@@ -798,6 +799,267 @@ def _stay_point_use_year(stay, crow):
     return _dvc_use_year(stay.get("check_in"), crow.get("use_year"))
 
 
+def _banking_deadline_date(use_year_name, use_year_calendar_year):
+    """Last day points from this use year can be banked into the next one.
+
+    Per DVC's published rule, the deadline is the end of the 8th month of
+    the use year, counting the use year's own start month as month 1
+    (e.g. a June use year's points must be banked by January 31).
+    """
+    start_month = _use_year_start_month(use_year_name)
+    total = start_month + 7
+    deadline_year = int(use_year_calendar_year) + (1 if total > 12 else 0)
+    deadline_month = ((total - 1) % 12) + 1
+    last_day = calendar.monthrange(deadline_year, deadline_month)[1]
+    return date(deadline_year, deadline_month, last_day)
+
+
+def _use_year_end_date(use_year_name, use_year_calendar_year):
+    """Last day of the use year itself — when unbanked, unused points are
+    actually forfeited (as opposed to the earlier banking deadline, which
+    is just the cutoff to move them into the next use year)."""
+    start_month = _use_year_start_month(use_year_name)
+    end_month = 12 if start_month == 1 else start_month - 1
+    end_year = int(use_year_calendar_year) + 1
+    last_day = calendar.monthrange(end_year, end_month)[1]
+    return date(end_year, end_month, last_day)
+
+
+def _banking_alerts(contracts_df, ledger_df):
+    """Flag points sitting in the current use year that are still unbanked
+    and unused, as the DVC banking deadline approaches or has passed."""
+    alerts = []
+    if contracts_df is None or contracts_df.empty or ledger_df is None or ledger_df.empty:
+        return alerts
+    today = date.today()
+    led = ledger_df.copy()
+    led["use_year"] = pd.to_numeric(led["use_year"], errors="coerce")
+    for _, c in contracts_df.iterrows():
+        uy_name = c.get("use_year") or "June"
+        cur_uy = _dvc_use_year(today.isoformat(), uy_name)
+        if cur_uy is None:
+            continue
+        row = led[(led["contract_id"] == c["id"]) & (led["use_year"] == cur_uy)]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        available = max(0.0, float(r.get("annual_points") or 0) + float(r.get("banked_in") or 0)
+                         - float(r.get("banked_points") or 0) - float(r.get("expired_points") or 0))
+        remaining = max(0.0, available - float(r.get("used_points") or 0))
+        if remaining <= 0:
+            continue
+        deadline = _banking_deadline_date(uy_name, cur_uy)
+        uy_end = _use_year_end_date(uy_name, cur_uy)
+        days_left = (deadline - today).days
+        if days_left < 0:
+            severity = "overdue"
+        elif days_left <= 14:
+            severity = "urgent"
+        elif days_left <= 45:
+            severity = "soon"
+        else:
+            continue
+        alerts.append({
+            "resort": c.get("resort") or "Your contract",
+            "use_year_label": f"{uy_name} {cur_uy}",
+            "remaining": remaining,
+            "deadline": deadline,
+            "uy_end": uy_end,
+            "days_left": days_left,
+            "severity": severity,
+        })
+    alerts.sort(key=lambda a: a["days_left"])
+    return alerts
+
+
+def _points_snapshot(contracts_df, ledger_df):
+    """Per-contract current-use-year point status: how many points are
+    available right now, and the banking/use-by dates for that use year.
+    This is the always-visible 'where do I stand' view — separate from the
+    banking-deadline alerts, which only fire as a deadline gets close."""
+    snapshot = []
+    if contracts_df is None or contracts_df.empty:
+        return snapshot
+    today = date.today()
+    led = ledger_df.copy() if ledger_df is not None and not ledger_df.empty else pd.DataFrame()
+    if not led.empty:
+        led["use_year"] = pd.to_numeric(led["use_year"], errors="coerce")
+    for _, c in contracts_df.iterrows():
+        uy_name = c.get("use_year") or "June"
+        cur_uy = _dvc_use_year(today.isoformat(), uy_name)
+        if cur_uy is None:
+            continue
+        remaining = float(c.get("points") or 0)
+        if not led.empty:
+            match = led[(led["contract_id"] == c["id"]) & (led["use_year"] == cur_uy)]
+            if not match.empty:
+                r = match.iloc[0]
+                available = max(0.0, float(r.get("annual_points") or 0) + float(r.get("banked_in") or 0)
+                                 - float(r.get("banked_points") or 0) - float(r.get("expired_points") or 0))
+                remaining = max(0.0, available - float(r.get("used_points") or 0))
+        snapshot.append({
+            "resort": c.get("resort") or "Contract",
+            "use_year_label": f"{uy_name} {cur_uy}",
+            "remaining": remaining,
+            "deadline": _banking_deadline_date(uy_name, cur_uy),
+            "uy_end": _use_year_end_date(uy_name, cur_uy),
+        })
+    return snapshot
+
+
+def _lifetime_projection(contracts_df, dues_df, stays_df, ledger_df, purchase_cost, contract_end_year, current_year, assumptions):
+    """Year-by-year cumulative DVC cost vs. alternative-cost scenarios, from
+    the earliest purchase year through contract_end_year.
+
+    `assumptions` is a dict with: dues_growth, gift_card_discount,
+    room_growth, annual_room_value, value_resort_ratio_pct, cash_discount_pct,
+    investment_return, dvc_rental_rate, rental_growth — the same values the
+    'Projection assumptions' panel edits.
+
+    Returns (proj_dataframe, purchase_year). proj is empty when there isn't
+    enough data yet (no contracts, or no contract end date). This is the
+    single source of truth for the projection — both the Dashboard headline
+    and the detailed lifetime chart call this same function, so they can
+    never disagree with each other.
+    """
+    if contracts_df is None or contracts_df.empty or contract_end_year is None:
+        return pd.DataFrame(), None
+
+    dues_growth = assumptions["dues_growth"]
+    gift_discount = assumptions["gift_card_discount"]
+    room_growth = assumptions["room_growth"]
+    annual_room_value = assumptions["annual_room_value"]
+    value_resort_ratio = float(assumptions["value_resort_ratio_pct"]) / 100.0
+    cash_discount_pct = assumptions["cash_discount_pct"]
+    investment_return = assumptions["investment_return"]
+    dvc_rental_rate = assumptions["dvc_rental_rate"]
+    rental_growth = assumptions["rental_growth"]
+
+    purchase_year = int(pd.to_datetime(contracts_df["purchase_date"], errors="coerce").dt.year.min())
+
+    actual_dues_by_year = {}
+    baseline_year = None
+    baseline_actual_cost = 0.0
+    baseline_published = 0.0
+    if dues_df is not None and not dues_df.empty:
+        dproj = dues_df.copy()
+        if "actual_cost" in dproj.columns:
+            dproj["effective_cost"] = dproj["actual_cost"].where(dproj["actual_cost"].notna() & (dproj["actual_cost"] > 0), dproj["amount"])
+        else:
+            dproj["effective_cost"] = dproj["amount"]
+        actual_dues_by_year = dproj.groupby("year")["effective_cost"].sum().to_dict()
+        full = dproj[dproj["is_prorated"].fillna(0) == 0].copy() if "is_prorated" in dproj.columns else dproj.copy()
+        if not full.empty:
+            baseline_year = int(full["year"].max())
+            baseline_actual_cost = float(full.loc[full["year"] == baseline_year, "effective_cost"].sum())
+            if "published_amount" in full.columns:
+                baseline_published = float(full.loc[full["year"] == baseline_year, "published_amount"].fillna(0).sum())
+    use_published_baseline = baseline_published > 0
+
+    actual_room_by_year = {}
+    actual_value_by_year = {}
+    if stays_df is not None and not stays_df.empty:
+        sproj = stays_df.copy()
+        sproj["year"] = pd.to_datetime(sproj["check_in"], errors="coerce").dt.year
+        actual_room_by_year = sproj.groupby("year")["cash_room_value"].sum().to_dict()
+        if "value_resort_value" in sproj.columns:
+            actual_value_by_year = sproj.groupby("year")["value_resort_value"].sum().to_dict()
+
+    annual_points_by_year = {}
+    if ledger_df is not None and not ledger_df.empty:
+        annual_points_by_year = ledger_df.groupby("use_year")["used_points"].sum().to_dict()
+    annual_entitlement = float(contracts_df["points"].fillna(0).sum()) if "points" in contracts_df.columns else 0.0
+
+    rows = []
+    cumulative_cost = purchase_cost
+    cumulative_room = 0.0
+    cumulative_value_alt = 0.0
+    cumulative_discounted_cash = 0.0
+    cumulative_rental = 0.0
+    portfolio_if_not_bought = purchase_cost
+    cumulative_opportunity_gap = 0.0
+
+    for y in range(purchase_year, int(contract_end_year) + 1):
+        if y in actual_dues_by_year:
+            year_dues = float(actual_dues_by_year[y]); dues_status = "Actual"
+        elif baseline_year is not None and y > baseline_year:
+            years_after = y - baseline_year
+            if use_published_baseline:
+                gross_est = baseline_published * ((1 + dues_growth / 100.0) ** years_after)
+                year_dues = gross_est * (1 - gift_discount / 100.0)
+            else:
+                year_dues = baseline_actual_cost * ((1 + dues_growth / 100.0) ** years_after)
+            dues_status = "Estimated"
+        else:
+            year_dues = 0.0; dues_status = "Pending baseline"
+        cumulative_cost += year_dues
+
+        if y in actual_room_by_year and float(actual_room_by_year[y]) > 0:
+            year_room = float(actual_room_by_year[y]); room_status = "Actual"
+        elif y > current_year and annual_room_value > 0:
+            year_room = annual_room_value * ((1 + room_growth / 100.0) ** (y - current_year)); room_status = "Estimated"
+        elif y == current_year and annual_room_value > 0 and y not in actual_room_by_year:
+            year_room = annual_room_value; room_status = "Estimated"
+        else:
+            year_room = float(actual_room_by_year.get(y, 0.0)); room_status = "Actual" if year_room > 0 else "Pending"
+        cumulative_room += year_room
+
+        actual_value = float(actual_value_by_year.get(y, 0) or 0)
+        if actual_value > 0:
+            year_value_alt = actual_value; value_alt_status = "Actual"
+        elif year_room > 0:
+            year_value_alt = year_room * value_resort_ratio; value_alt_status = "Estimated"
+        else:
+            year_value_alt = 0.0; value_alt_status = "Pending"
+        cumulative_value_alt += year_value_alt
+
+        year_discounted_cash = year_room * (1 - cash_discount_pct / 100.0)
+        cumulative_discounted_cash += year_discounted_cash
+
+        points_for_rental = float(annual_points_by_year.get(y, 0) or 0)
+        if points_for_rental <= 0 and y >= purchase_year:
+            points_for_rental = annual_entitlement
+        years_since_current = max(0, y - current_year)
+        year_rental_rate = dvc_rental_rate * ((1 + rental_growth / 100.0) ** years_since_current)
+        year_rental = points_for_rental * year_rental_rate if points_for_rental > 0 else 0.0
+        cumulative_rental += year_rental
+
+        if y == purchase_year:
+            portfolio_if_not_bought = purchase_cost * (1 + investment_return / 100.0)
+        else:
+            portfolio_if_not_bought *= (1 + investment_return / 100.0)
+        annual_savings_vs_cash = year_discounted_cash - year_dues
+        portfolio_if_not_bought += annual_savings_vs_cash
+        cumulative_opportunity_gap = portfolio_if_not_bought - cumulative_cost
+
+        rows.append({
+            "Year": y,
+            "Cumulative DVC Cost": round(cumulative_cost, 2),
+            "Equivalent Cash Room Cost": round(cumulative_room, 2),
+            "Cumulative Value Resort Cost": round(cumulative_value_alt, 2),
+            "Discounted Cash Cost": round(cumulative_discounted_cash, 2),
+            "DVC Rental Cost": round(cumulative_rental, 2),
+            "Invest & Pay Cash Advantage": round(cumulative_opportunity_gap, 2),
+            "Annual Dues Cost": round(year_dues, 2),
+            "Annual Room Value": round(year_room, 2),
+            "Annual Value Resort Cost": round(year_value_alt, 2),
+            "Dues": dues_status,
+            "Room Value": room_status,
+            "Value Resort": value_alt_status,
+        })
+
+    return pd.DataFrame(rows), purchase_year
+
+
+def _break_even_year(proj, cost_col, alt_col):
+    """First year in proj where alt_col has caught up to cost_col, or None
+    if that never happens within the projected horizon."""
+    if proj is None or proj.empty:
+        return None
+    hit = proj[proj[alt_col] >= proj[cost_col]]
+    return int(hit.iloc[0]["Year"]) if not hit.empty else None
+
+
 def sync_point_ledger():
     """Build the point schedule from contracts and automatically allocate stays.
 
@@ -1129,6 +1391,48 @@ tabs = st.tabs(["🏰 Dashboard", "📜 Contracts", "💰 Annual Dues", "🛏️
 # DASHBOARD
 # ============================================================
 with tabs[0]:
+    for _alert in _banking_alerts(contracts, ledger):
+        _pts = f"{int(round(_alert['remaining'])):,}"
+        _deadline_str = _alert["deadline"].strftime("%B %-d, %Y") if hasattr(_alert["deadline"], "strftime") else str(_alert["deadline"])
+        _uy_end_str = _alert["uy_end"].strftime("%B %-d, %Y") if hasattr(_alert["uy_end"], "strftime") else str(_alert["uy_end"])
+        if _alert["severity"] == "overdue":
+            st.error(
+                f"⏰ **Banking deadline passed** — {_alert['resort']} ({_alert['use_year_label']}): "
+                f"the deadline was **{_deadline_str}**. **{_pts} points** can no longer be banked — "
+                f"use them before **{_uy_end_str}** or they'll be forfeited."
+            )
+        elif _alert["severity"] == "urgent":
+            _days = _alert["days_left"]
+            st.error(
+                f"⏰ **Banking deadline in {_days} day{'s' if _days != 1 else ''}** — "
+                f"{_alert['resort']} ({_alert['use_year_label']}): **{_deadline_str}**. "
+                f"**{_pts} points** are still unbanked and unused. Bank them now, or book a trip that "
+                f"uses them before **{_uy_end_str}**."
+            )
+        else:
+            st.warning(
+                f"🗓️ Banking deadline for {_alert['resort']} ({_alert['use_year_label']}) is "
+                f"**{_deadline_str}** ({_alert['days_left']} days away). "
+                f"**{_pts} points** are currently unbanked."
+            )
+
+    # ---------------- Points snapshot: the #1 thing to check at a glance ----------------
+    _snapshot = _points_snapshot(contracts, ledger)
+    if _snapshot:
+        st.markdown("### 🎟️ Your Points Right Now")
+        if len(_snapshot) > 1:
+            _total_remaining = sum(s["remaining"] for s in _snapshot)
+            st.metric("Total points available (all contracts)", f"{int(round(_total_remaining)):,}")
+        for _s in _snapshot:
+            with st.container(border=True):
+                _sc1, _sc2 = st.columns([1, 1.4])
+                _sc1.metric(_s["resort"], f"{int(round(_s['remaining'])):,} pts", help=f"Use year: {_s['use_year_label']}")
+                _sc2.markdown(
+                    f"**Bank by:** {_s['deadline']:%b %-d, %Y}  \n"
+                    f"**Use by:** {_s['uy_end']:%b %-d, %Y}"
+                )
+        st.caption("Points shown are what's left in your current use year — after banking, borrowing, and any stays already recorded.")
+
     gross_purchase_cost = float(contracts["purchase_price"].sum() + contracts["closing_costs"].sum()) if not contracts.empty else 0
     purchase_incentives = float(contracts["purchase_incentives"].sum()) if (not contracts.empty and "purchase_incentives" in contracts.columns) else 0
     magical_beginnings = float(contracts["magical_beginnings"].sum()) if (not contracts.empty and "magical_beginnings" in contracts.columns) else 0
@@ -1206,6 +1510,62 @@ with tabs[0]:
         except (TypeError, ValueError):
             return "$0"
 
+    # ---------------- Are you getting your money's worth? (priority #2) ----------------
+    # Single headline answer, computed vs. paying cash for the same rooms — the
+    # most direct comparison. Uses SAVED projection assumptions so it can render
+    # here before the (collapsed) assumptions panel further down even exists.
+    # The detailed section below calls this exact same function with live widget
+    # values, so the two can never quietly disagree with each other.
+    st.markdown("### 💸 Are You Getting Your Money's Worth?")
+    _settings_row = query("SELECT * FROM projection_settings WHERE id=1").iloc[0]
+
+    _contract_end_year = None
+    if not contracts.empty and "contract_end_date" in contracts.columns:
+        _valid_ends = pd.to_datetime(contracts["contract_end_date"], errors="coerce").dropna()
+        if not _valid_ends.empty:
+            _contract_end_year = int(_valid_ends.dt.year.max())
+
+    if contracts.empty:
+        st.info("Add your DVC contract to see your break-even projection.")
+    elif _contract_end_year is None:
+        st.info("Add your contract's legal end date on the Contracts tab to see when you break even.")
+    else:
+        _derived_room_value = 0.0
+        if not stays.empty:
+            _positive = stays.copy()
+            _positive["year"] = pd.to_datetime(_positive["check_in"], errors="coerce").dt.year
+            _positive = _positive.groupby("year")["cash_room_value"].sum()
+            _positive = _positive[_positive > 0]
+            if not _positive.empty:
+                _derived_room_value = float(_positive.iloc[-1])
+        _saved_room_value = float(_settings_row["annual_room_value"])
+        _headline_assumptions = {
+            "dues_growth": float(_settings_row["dues_growth"]),
+            "gift_card_discount": float(_settings_row["gift_card_discount"]),
+            "room_growth": float(_settings_row["room_growth"]),
+            "annual_room_value": _saved_room_value if _saved_room_value > 0 else _derived_room_value,
+            "value_resort_ratio_pct": float(_settings_row["value_resort_ratio"]) * 100.0,
+            "cash_discount_pct": float(_settings_row["cash_discount"]),
+            "investment_return": float(_settings_row["investment_return"]),
+            "dvc_rental_rate": float(_settings_row["dvc_rental_rate"]),
+            "rental_growth": float(_settings_row["rental_growth"]),
+        }
+        _headline_proj, _ = _lifetime_projection(
+            contracts, dues, stays, ledger, purchase_cost, _contract_end_year, current_year, _headline_assumptions
+        )
+        _be_year = _break_even_year(_headline_proj, "Cumulative DVC Cost", "Equivalent Cash Room Cost")
+        if _be_year is not None and _be_year <= current_year:
+            st.success(f"🎉 **You broke even in {_be_year}** — compared to paying cash for the same rooms, DVC has already paid for itself.")
+        elif _be_year is not None:
+            _years_away = _be_year - current_year
+            st.info(f"📈 **On pace to break even in {_be_year}** — {_years_away} year{'s' if _years_away != 1 else ''} from now, compared to paying cash for the same rooms.")
+        else:
+            st.warning(f"⚠️ Not currently on pace to break even (vs. paying cash) before your contract ends in **{_contract_end_year}**. This is sensitive to your future usage and room-value estimate — see the assumptions in the Lifetime section below.")
+        st.caption(
+            f"As of today, you're **{'ahead' if net_value_created >= 0 else 'behind'} {_ui_currency(abs(net_value_created))}** "
+            "based on recorded stays vs. total cash invested (purchase + dues)."
+        )
+
     # Dashboard hierarchy: ownership first, then actual performance, then owner
     # efficiency. This avoids presenting the acquisition price and vacation value as
     # if they were the same type of metric.
@@ -1234,9 +1594,9 @@ with tabs[0]:
     if driven_spend > 0:
         st.caption(f"Trip spending tracked separately: **${driven_spend:,.0}**. It is not included in DVC ownership cost because those expenses would generally exist whether the stay was owned, rented, or paid in cash.")
 
-    # ---------------- Lifetime projection ----------------
-    st.markdown("## ✨ Lifetime DVC Break-Even Journey")
-    st.caption("Actual years use your recorded data. Future years are estimated all the way through the legal contract expiration.")
+    # ---------------- Lifetime projection (detail) ----------------
+    st.markdown("## ✨ Lifetime Break-Even Detail")
+    st.caption("This is the full detail behind the headline above: every comparison basis, and the assumptions driving the projection. Actual years use your recorded data; future years are estimated through the legal contract expiration.")
 
     settings = query("SELECT * FROM projection_settings WHERE id=1").iloc[0]
 
@@ -1288,7 +1648,7 @@ with tabs[0]:
     saved_room = float(settings["annual_room_value"])
     default_room = saved_room if saved_room > 0 else derived_room_value
 
-    with st.expander("⚙️ Projection assumptions", expanded=True):
+    with st.expander("⚙️ Projection assumptions", expanded=False):
         p1, p2 = st.columns(2)
         with p1:
             dues_growth = st.number_input(
@@ -1375,181 +1735,60 @@ with tabs[0]:
     elif contract_end_year is None:
         st.info("Once you add the contract end date, this graph will run through that year automatically.")
     else:
-        purchase_year = int(pd.to_datetime(contracts["purchase_date"], errors="coerce").dt.year.min())
-
-        # Actual dues by year and future baseline from latest NON-prorated full year.
-        actual_dues_by_year = {}
-        baseline_year = None
-        baseline_actual_cost = 0.0
-        baseline_published = 0.0
-
-        if not dues.empty:
-            dproj = dues.copy()
-            if "actual_cost" in dproj.columns:
-                dproj["effective_cost"] = dproj["actual_cost"].where(
-                    dproj["actual_cost"].notna() & (dproj["actual_cost"] > 0),
-                    dproj["amount"]
-                )
-            else:
-                dproj["effective_cost"] = dproj["amount"]
-
-            actual_dues_by_year = dproj.groupby("year")["effective_cost"].sum().to_dict()
-
-            if "is_prorated" in dproj.columns:
-                full = dproj[dproj["is_prorated"].fillna(0) == 0].copy()
-            else:
-                full = dproj.copy()
-
-            if not full.empty:
-                baseline_year = int(full["year"].max())
-                baseline_actual_cost = float(full.loc[full["year"] == baseline_year, "effective_cost"].sum())
-                if "published_amount" in full.columns:
-                    pubs = full.loc[full["year"] == baseline_year, "published_amount"].fillna(0)
-                    baseline_published = float(pubs.sum())
-
-        # If published dues are known, grow those and then apply future gift-card discount.
-        # Otherwise grow actual out-of-pocket cost; don't apply the discount twice.
-        use_published_baseline = baseline_published > 0
-
-        # Value Resort comparison: actual same-trip prices win; otherwise use the
-        # editable percentage of the DVC room value.
-        actual_value_by_year = {}
-        if not stays.empty and "value_resort_value" in stays.columns:
-            svalue = stays.copy()
-            svalue["year"] = pd.to_datetime(svalue["check_in"], errors="coerce").dt.year
-            actual_value_by_year = svalue.groupby("year")["value_resort_value"].sum().to_dict()
+        _live_assumptions = {
+            "dues_growth": dues_growth,
+            "gift_card_discount": gift_discount,
+            "room_growth": room_growth,
+            "annual_room_value": annual_room_value,
+            "value_resort_ratio_pct": value_resort_ratio_pct,
+            "cash_discount_pct": cash_discount_pct,
+            "investment_return": investment_return,
+            "dvc_rental_rate": dvc_rental_rate,
+            "rental_growth": rental_growth,
+        }
+        proj, purchase_year = _lifetime_projection(
+            contracts, dues, stays, ledger, purchase_cost, contract_end_year, current_year, _live_assumptions
+        )
         value_resort_ratio = float(value_resort_ratio_pct) / 100.0
 
-        rows = []
-        cumulative_cost = purchase_cost
-        cumulative_room = 0.0
-        cumulative_value_alt = 0.0
-        cumulative_discounted_cash = 0.0
-        cumulative_rental = 0.0
-        portfolio_if_not_bought = purchase_cost
-        cumulative_opportunity_gap = 0.0
-        annual_points_by_year = {}
-        if not ledger.empty:
-            annual_points_by_year = ledger.groupby("use_year")["used_points"].sum().to_dict()
-
-        for y in range(purchase_year, contract_end_year + 1):
-            # Dues
-            if y in actual_dues_by_year:
-                year_dues = float(actual_dues_by_year[y])
-                dues_status = "Actual"
-            elif baseline_year is not None and y > baseline_year:
-                years_after = y - baseline_year
-                if use_published_baseline:
-                    gross_est = baseline_published * ((1 + dues_growth / 100.0) ** years_after)
-                    year_dues = gross_est * (1 - gift_discount / 100.0)
-                else:
-                    year_dues = baseline_actual_cost * ((1 + dues_growth / 100.0) ** years_after)
-                dues_status = "Estimated"
-            else:
-                year_dues = 0.0
-                dues_status = "Pending baseline"
-
-            cumulative_cost += year_dues
-
-            # Room value
-            if y in actual_room_by_year and float(actual_room_by_year[y]) > 0:
-                year_room = float(actual_room_by_year[y])
-                room_status = "Actual"
-            elif y > current_year and annual_room_value > 0:
-                year_room = annual_room_value * ((1 + room_growth / 100.0) ** (y - current_year))
-                room_status = "Estimated"
-            elif y == current_year and annual_room_value > 0 and y not in actual_room_by_year:
-                year_room = annual_room_value
-                room_status = "Estimated"
-            else:
-                year_room = float(actual_room_by_year.get(y, 0.0))
-                room_status = "Actual" if year_room > 0 else "Pending"
-
-            cumulative_room += year_room
-
-            actual_value = float(actual_value_by_year.get(y, 0) or 0)
-            if actual_value > 0:
-                year_value_alt = actual_value
-                value_alt_status = "Actual"
-            elif year_room > 0:
-                year_value_alt = year_room * value_resort_ratio
-                value_alt_status = "Estimated"
-            else:
-                year_value_alt = 0.0
-                value_alt_status = "Pending"
-            cumulative_value_alt += year_value_alt
-
-            # Discounted cash alternative: same DVC room value, but assume the user
-            # normally buys Disney cash rooms at a configurable discount to rack.
-            year_discounted_cash = year_room * (1 - cash_discount_pct / 100.0)
-            cumulative_discounted_cash += year_discounted_cash
-
-            # DVC rental alternative: actual points used when known, otherwise annual allocation.
-            points_for_rental = float(annual_points_by_year.get(y, 0) or 0)
-            if points_for_rental <= 0 and y >= purchase_year:
-                # Default future rental comparison to the contract's annual allocation.
-                # This is derived here so the projection never depends on a variable
-                # defined later in the script.
-                annual_entitlement = float(contracts["points"].fillna(0).sum()) if not contracts.empty and "points" in contracts.columns else 0.0
-                points_for_rental = annual_entitlement
-            years_since_current = max(0, y - current_year)
-            year_rental_rate = dvc_rental_rate * ((1 + rental_growth / 100.0) ** years_since_current)
-            year_rental = points_for_rental * year_rental_rate if points_for_rental > 0 else 0.0
-            cumulative_rental += year_rental
-
-            # Opportunity-cost scenario: invest the acquisition cash instead, and
-            # compare the resulting portfolio to the DVC ownership path.
-            if y == purchase_year:
-                portfolio_if_not_bought = purchase_cost * (1 + investment_return / 100.0)
-            else:
-                portfolio_if_not_bought *= (1 + investment_return / 100.0)
-            annual_savings_vs_cash = year_discounted_cash - year_dues
-            portfolio_if_not_bought += annual_savings_vs_cash
-            cumulative_opportunity_gap = portfolio_if_not_bought - cumulative_cost
-
-            rows.append({
-                "Year": y,
-                "Cumulative DVC Cost": round(cumulative_cost, 2),
-                "Equivalent Cash Room Cost": round(cumulative_room, 2),
-                "Cumulative Value Resort Cost": round(cumulative_value_alt, 2),
-                "Discounted Cash Cost": round(cumulative_discounted_cash, 2),
-                "DVC Rental Cost": round(cumulative_rental, 2),
-                "Invest & Pay Cash Advantage": round(cumulative_opportunity_gap, 2),
-                "Annual Dues Cost": round(year_dues, 2),
-                "Annual Room Value": round(year_room, 2),
-                "Annual Value Resort Cost": round(year_value_alt, 2),
-                "Dues": dues_status,
-                "Room Value": room_status,
-                "Value Resort": value_alt_status
-            })
-
-        proj = pd.DataFrame(rows)
+        # Default to the 2 lines that answer "when do I break even": DVC cost vs.
+        # paying cash for the same rooms (matches the Dashboard headline above).
+        # The other 3 comparisons are opt-in, so the crossover point stays easy
+        # to actually see instead of getting lost among 5 overlapping lines.
+        st.caption("The headline above uses the cash-room comparison (matches the default line here). Add the others below if you want to see them too.")
+        _extra1, _extra2, _extra3 = st.columns(3)
+        _show_value_resort = _extra1.checkbox("Value Resort alternative", value=False)
+        _show_discounted = _extra2.checkbox("Discounted cash", value=False)
+        _show_rental = _extra3.checkbox("DVC rental", value=False)
 
         fig_life = go.Figure()
         fig_life.add_trace(go.Scatter(
             x=proj["Year"], y=proj["Cumulative DVC Cost"],
-            mode="lines", name="Cumulative DVC cost"
+            mode="lines", name="Cumulative DVC cost", line=dict(width=3)
         ))
         fig_life.add_trace(go.Scatter(
             x=proj["Year"], y=proj["Equivalent Cash Room Cost"],
-            mode="lines", name="Equivalent cash room cost"
+            mode="lines", name="Equivalent cash room cost", line=dict(width=3)
         ))
-        fig_life.add_trace(go.Scatter(
-            x=proj["Year"], y=proj["Cumulative Value Resort Cost"],
-            mode="lines", name=f"Value Resort alternative ({value_resort_ratio_pct:.0f}% fallback)"
-        ))
-        fig_life.add_trace(go.Scatter(
-            x=proj["Year"], y=proj["Discounted Cash Cost"],
-            mode="lines", name=f"Discounted cash ({cash_discount_pct:.0f}% off)"
-        ))
-        fig_life.add_trace(go.Scatter(
-            x=proj["Year"], y=proj["DVC Rental Cost"],
-            mode="lines", name=f"DVC rental (${dvc_rental_rate:.0f}/pt)"
-        ))
+        if _show_value_resort:
+            fig_life.add_trace(go.Scatter(
+                x=proj["Year"], y=proj["Cumulative Value Resort Cost"],
+                mode="lines", name=f"Value Resort alternative ({value_resort_ratio_pct:.0f}% fallback)"
+            ))
+        if _show_discounted:
+            fig_life.add_trace(go.Scatter(
+                x=proj["Year"], y=proj["Discounted Cash Cost"],
+                mode="lines", name=f"Discounted cash ({cash_discount_pct:.0f}% off)"
+            ))
+        if _show_rental:
+            fig_life.add_trace(go.Scatter(
+                x=proj["Year"], y=proj["DVC Rental Cost"],
+                mode="lines", name=f"DVC rental (${dvc_rental_rate:.0f}/pt)"
+            ))
         fig_life.update_layout(
             title=f"Lifetime projection through {contract_end_year}",
             xaxis_title="Year", yaxis_title="Dollars",
-            height=500, legend_title_text="",
+            height=420, legend_title_text="",
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"
         )
         st.plotly_chart(fig_life, use_container_width=True)
@@ -1591,7 +1830,7 @@ with tabs[0]:
         e6.metric("DVC rental alternative", f"${ending['DVC Rental Cost']:,.0f}")
         e7.metric("Opportunity-cost advantage", f"${ending['Invest & Pay Cash Advantage']:,.0f}", help="Positive means the invest-and-pay-cash scenario has more modeled financial value than the DVC ownership path under the selected assumptions.")
 
-        with st.expander("📅 Year-by-year comparison", expanded=True):
+        with st.expander("📅 Year-by-year comparison (full detail table)", expanded=False):
             st.caption(
                 "Actual values are shown in dark blue. Estimated values are shown in gold. "
                 "Cumulative projected values remain gold until actual data takes over."
@@ -1746,11 +1985,13 @@ with tabs[0]:
                 "unless you enter an actual same-date Value Resort benchmark for that year. Discounted cash and rental are modeled alternatives."
             )
 
-        if baseline_year is None:
+        _has_dues_baseline = False
+        if not dues.empty:
+            _has_dues_baseline = bool((dues["is_prorated"].fillna(0) == 0).any()) if "is_prorated" in dues.columns else True
+        if not _has_dues_baseline:
             st.warning("You do not yet have a full, non-prorated dues year entered. Add your 2026 full-year dues to make future dues estimates meaningful.")
 
-    # ---------------- DVC Financial Health ----------------
-    st.markdown("## 🏰 DVC Financial Health")
+    # ---------------- DVC Financial Health (deep dive, collapsed) ----------------
     # Score rewards high utilization, positive modeled savings and long remaining life;
     # it is a diagnostic, not a statement of guaranteed investment performance.
     remaining_years = max(0, contract_end_year - current_year) if contract_end_year else 0
@@ -1760,14 +2001,15 @@ with tabs[0]:
     score_eff = 25 if stay_nights > 0 and utilization_pct >= 80 else 18 if stay_nights > 0 else 8
     health_score = int(max(0, min(100, round(score_util + score_value + score_life + score_eff))))
     health_label = "Excellent" if health_score >= 85 else "Strong" if health_score >= 70 else "Watch" if health_score >= 50 else "Needs attention"
-    h1,h2,h3 = st.columns([1,2,2])
-    h1.metric("Financial Health", f"{health_score}/100")
-    h2.metric("Status", health_label)
-    h3.metric("Net value created", f"${net_value_created:,.0f}", help="Recorded DVC lodging value minus net acquisition cost and dues paid. This is the same gap used to determine whether the recorded lodging has recovered ownership cost.")
-    st.caption("Health score is a dashboard diagnostic based on utilization, realized lodging value, remaining contract life and usage. It is not an investment rating.")
 
-    # Historical methodology panel
-    with st.expander("📚 Historical data & methodology", expanded=False):
+    with st.expander(f"🏰 DVC Financial Health — {health_score}/100 ({health_label})", expanded=False):
+        h1,h2,h3 = st.columns([1,2,2])
+        h1.metric("Financial Health", f"{health_score}/100")
+        h2.metric("Status", health_label)
+        h3.metric("Net value created", f"${net_value_created:,.0f}", help="Recorded DVC lodging value minus net acquisition cost and dues paid. This is the same gap used to determine whether the recorded lodging has recovered ownership cost.")
+        st.caption("Health score is a dashboard diagnostic based on utilization, realized lodging value, remaining contract life and usage. It is not an investment rating.")
+
+        st.markdown("#### 📚 Historical data & methodology")
         st.markdown("**Dues:** The app can use your actual annual dues first, then a resort-specific historical baseline, then your editable growth assumption. Historical reference: DVCNews annual-dues history (2015–2026 for Polynesian). DVCNews publishes annual dues histories by resort; DVC Genie currently uses 5% as its expected forward scenario. Historical dues are therefore treated as data, not a universal 5% rule.")
         st.markdown("**Room rates:** Actual stay cash values take priority. If no actual future benchmark exists, the app uses the latest actual annual DVC room-value baseline and your editable room-growth assumption. Disney cash-room pricing is highly date-dependent, so a single historical rate series should not overwrite actual stay data.")
         st.markdown("**Cash discounts:** The discounted-cash line applies your selected typical discount to the DVC room value rather than assuming rack rate every time.")

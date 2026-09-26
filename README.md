@@ -1,6 +1,15 @@
-# DVC Tracker v3.7
+# DVC Tracker v3.9
 
 A Streamlit app for tracking the true cost and value of a Disney Vacation Club membership: contracts, annual dues, stays, trip expenses, and an automatic point ledger.
+
+## Dashboard Priority Order (v3.9)
+The Dashboard is now ordered around what you actually open it to check, top to bottom:
+1. **Banking deadline alerts** — only shown when a deadline is actually approaching or overdue.
+2. **Your Points Right Now** — remaining points per contract, current use year, and the bank-by/use-by dates. Aggregates across contracts if you have more than one.
+3. **Are You Getting Your Money's Worth?** — one headline answer (broke even in `<year>` / on pace for `<year>` / not on pace), computed vs. paying cash for the same rooms.
+4. Everything else — Ownership/Performance KPIs, the full lifetime break-even detail (assumptions, chart, all 4 comparison bases), the year-by-year table, and the Financial Health score — still there, just below, and the deepest/most detailed pieces (year-by-year table, Financial Health) are now collapsed by default instead of always expanded.
+
+The headline in #3 and the detailed projection further down share the exact same calculation function, so they can't drift out of sync with each other — the headline just uses your last-saved assumptions, and the detailed section lets you tune them live.
 
 ## Automatic Point Ledger
 - Annual entitlement is derived from each contract every use year through contract expiration.
@@ -9,6 +18,14 @@ A Streamlit app for tracking the true cost and value of a Disney Vacation Club m
 - Banked-in and borrowed-out flows are carried to adjacent use years automatically.
 - Dashboard reports current-use-year points remaining rather than inventing lifetime unused points.
 - Chrome/light theme fixes from v3.4 are retained.
+
+## Banking Deadline Reminders (v3.8)
+The Dashboard now warns you before you lose points. For each contract, it checks whether the current use year still has unbanked, unused points as DVC's 8-months-from-use-year-start banking deadline approaches (e.g. a June use year must be banked by January 31):
+- **45–15 days out:** a heads-up banner.
+- **14 days or less:** an urgent banner.
+- **Deadline already passed:** an overdue banner, with the date those points are actually forfeited (the end of the use year) if you still don't use them.
+
+This is computed from your existing contracts/ledger data — no setup required. It only fires when you actually have unbanked points at risk; fully banked or fully used use years stay quiet.
 
 v3.6: Fixed startup NameError from point-ledger migration by using the DB execute helper instead of an out-of-scope connection.
 
